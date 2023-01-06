@@ -52,6 +52,7 @@ struct proc {
   struct proc *next;
   int quantum_left;
   struct level *clevel;
+  int olevel;
 };
 
 struct level{

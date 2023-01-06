@@ -132,7 +132,7 @@ dequeue(struct level *src, struct proc *p){
 // state required to run in the kernel.
 // Otherwise return 0.
 static struct proc*
-allocproc(void)
+allocproc(int n)
 {
   struct proc *p;
   char *sp;
@@ -147,11 +147,12 @@ allocproc(void)
   return 0;
 
 found:
-  struct level *q = active->level + RSDL_STARTING_LEVEL;
+  struct level *q = active->level + n;
 
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->quantum_left = RSDL_PROC_QUANTUM;
+  p->olevel = n;
 
   // Allocate kernel stack.
   if((p->kstack = kalloc()) == 0){
@@ -160,7 +161,19 @@ found:
     return 0;
   }
 
-  enqueue(q, p);
+  while(q < active->level + RSDL_LEVELS){
+    if(q->quantum_left){
+      enqueue(q, p);
+      break;
+    }
+
+    q++;
+  }
+
+  if(q == active->level + RSDL_LEVELS){
+    enqueue(expired->level + n, p);
+  }
+
   release(&ptable.lock);
   sp = p->kstack + KSTACKSIZE;
 
@@ -189,7 +202,7 @@ userinit(void)
   struct proc *p;
   extern char _binary_initcode_start[], _binary_initcode_size[];
 
-  p = allocproc();
+  p = allocproc(RSDL_STARTING_LEVEL);
   
   initproc = p;
   if((p->pgdir = setupkvm()) == 0)
@@ -251,7 +264,51 @@ fork(void)
   struct proc *curproc = myproc();
 
   // Allocate process.
-  if((np = allocproc()) == 0){
+  if((np = allocproc(RSDL_STARTING_LEVEL)) == 0){
+    return -1;
+  }
+
+  // Copy process state from proc.
+  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+    kfree(np->kstack);
+    np->kstack = 0;
+    np->state = UNUSED;
+    return -1;
+  }
+  np->sz = curproc->sz;
+  np->parent = curproc;
+  *np->tf = *curproc->tf;
+
+  // Clear %eax so that fork returns 0 in the child.
+  np->tf->eax = 0;
+
+  for(i = 0; i < NOFILE; i++)
+    if(curproc->ofile[i])
+      np->ofile[i] = filedup(curproc->ofile[i]);
+  np->cwd = idup(curproc->cwd);
+
+  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+
+  pid = np->pid;
+
+  acquire(&ptable.lock);
+
+  np->state = RUNNABLE;
+
+  release(&ptable.lock);
+
+  return pid;
+}
+
+int
+priofork(int n)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *curproc = myproc();
+
+  // Allocate process.
+  if((np = allocproc(n)) == 0){
     return -1;
   }
 
@@ -361,6 +418,7 @@ wait(void)
         p->name[0] = 0;
         p->killed = 0;
         p->quantum_left = 0;
+        p->olevel = -1;
         p->state = UNUSED;
         release(&ptable.lock);
         return pid;
@@ -493,7 +551,7 @@ scheduler(void)
           }
           else{
             if(new_level == (active->level + RSDL_LEVELS)){
-              enqueue(expired->level + RSDL_STARTING_LEVEL, p);
+              enqueue(expired->level + (p->olevel), p);
             }
             else{
               enqueue(new_level, p);
@@ -514,7 +572,7 @@ scheduler(void)
             dequeue(clevel, t);
 
             if(new_level == active->level + RSDL_LEVELS){
-              enqueue(expired->level + RSDL_STARTING_LEVEL, t);
+              enqueue(expired->level + (t->olevel), t);
             }
             else{
               enqueue(new_level, t);
@@ -549,7 +607,7 @@ scheduler(void)
         struct proc *next = g->next;
         dequeue(e, g);
         
-        enqueue(active->level + RSDL_STARTING_LEVEL, g);
+        enqueue(active->level + (g->olevel), g);
         g->quantum_left = RSDL_PROC_QUANTUM; //replenish process quantum upon migration
         
         g = next;
