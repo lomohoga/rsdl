@@ -51,6 +51,13 @@ struct proc {
   char name[16];               // Process name (debugging)
   struct proc *next;
   int quantum_left;
+  struct level *clevel;
+};
+
+struct level{
+  struct proc HEAD;
+  struct proc *TAIL;
+  int quantum_left;
 };
 
 // Process memory is laid out contiguously, low addresses first:

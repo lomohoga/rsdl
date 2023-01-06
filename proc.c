@@ -7,11 +7,6 @@
 #include "proc.h"
 #include "spinlock.h"
 
-struct level{
-  struct proc HEAD;
-  struct proc *TAIL;
-};
-
 struct set{
   struct level level[RSDL_LEVELS];
 };
@@ -45,10 +40,12 @@ pinit(void)
     //for set 0
     struct level *d = a->level + c;
     d->TAIL = &(d->HEAD);
+    d->quantum_left = RSDL_LEVEL_QUANTUM;
 
     //for set 1
     struct level *e =  b->level + c;
     e->TAIL = &(e->HEAD);
+    e->quantum_left = RSDL_LEVEL_QUANTUM;
   }
   
   //initialize active and expired sets
@@ -99,6 +96,7 @@ static void
 enqueue(struct level *dest, struct proc *p){
 
   //p at this point MUST be dequeued!
+  p->clevel  = dest;
   dest->TAIL->next = p;
   dest->TAIL = p;
 }
@@ -117,6 +115,8 @@ dequeue(struct level *src, struct proc *p){
   return;
 
   remove:
+  p->clevel = 0;
+
   if(p == src->TAIL){
       src->TAIL = a;
       a->next = 0;
@@ -382,7 +382,7 @@ static void
 display(void){
   // print active set
   for(int a = 0; a < RSDL_LEVELS; a++){
-    cprintf("%d|active|%d(0)", ticks, a);
+    cprintf("%d|active|%d(%d)", ticks, a, (active->level + a)->quantum_left);
 
     struct proc *b = (active->level + a)->HEAD.next;
     while(b != 0){
@@ -395,7 +395,7 @@ display(void){
 
   // print expired set
   for(int c = 0; c < RSDL_LEVELS; c++){
-    cprintf("%d|expired|%d(0)", ticks, c);
+    cprintf("%d|expired|%d(%d)", ticks, c, (expired->level + c)->quantum_left);
 
     struct proc *d = (expired->level + c)->HEAD.next;
     while(d != 0){
@@ -442,6 +442,11 @@ scheduler(void)
     acquire(&ptable.lock);
 
     while(clevel < (active->level + RSDL_LEVELS)){
+      if(clevel->quantum_left == 0){
+        clevel++;
+        continue;
+      }
+
       p = clevel->HEAD.next;
 
       while(p != 0){
@@ -468,25 +473,59 @@ scheduler(void)
 
         dequeue(clevel, p);
 
+        if(p->state == ZOMBIE){
+          goto exited;
+        }
+
+        //find new level
+        struct level *new_level;
+        for(new_level = clevel + 1; new_level < (active->level + RSDL_LEVELS); new_level++){
+          if(new_level->quantum_left){
+            break;
+          }
+        }
+
         //see if p is exiting
-        if(p->state != ZOMBIE){
+        if(clevel->quantum_left){
+          //current level quantum IS NOT depleted
           if(p->quantum_left){
             enqueue(clevel, p);
           }
           else{
-            struct level *x = clevel + 1;
-
-            if(x == (active->level + RSDL_LEVELS)){
+            if(new_level == (active->level + RSDL_LEVELS)){
               enqueue(expired->level + RSDL_STARTING_LEVEL, p);
             }
             else{
-              enqueue(x, p);
+              enqueue(new_level, p);
             }
 
             p->quantum_left = RSDL_PROC_QUANTUM; //replenish quantum
           }
         }
+        else{
+          //enqueue p in the current level (makes it last)
+          enqueue(clevel, p);
 
+          //dequeue all proc on current level and enqueue them on new_level 
+          struct proc *t = clevel->HEAD.next;
+
+          while(t != 0){
+            struct proc *nxt = t->next;
+            dequeue(clevel, t);
+
+            if(new_level == active->level + RSDL_LEVELS){
+              enqueue(expired->level + RSDL_STARTING_LEVEL, t);
+            }
+            else{
+              enqueue(new_level, t);
+            }
+
+            t->quantum_left = RSDL_PROC_QUANTUM;  //replenish proc quantum
+            t = nxt;
+          }
+        }
+
+        exited:
         c->proc = 0;
         clevel = active->level;
         p = clevel->HEAD.next;
@@ -503,6 +542,7 @@ scheduler(void)
     // migrate processes from expired to active
     struct level *e;
     for(e = expired->level; e < (expired->level + RSDL_LEVELS); e++){
+      e->quantum_left = RSDL_LEVEL_QUANTUM;
       struct proc *g = e->HEAD.next;
 
       while(g != 0){

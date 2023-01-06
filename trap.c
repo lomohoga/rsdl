@@ -104,7 +104,11 @@ trap(struct trapframe *tf)
   // If interrupts were on while locks held, would need to check nlock.
   if(myproc() && myproc()->state == RUNNING &&
      tf->trapno == T_IRQ0+IRQ_TIMER){
-      if((--myproc()->quantum_left) == 0){
+      struct proc *p = myproc();
+      (p->clevel->quantum_left)--;
+      (p->quantum_left)--;
+
+      if(p->clevel->quantum_left == 0 || p->quantum_left == 0){
         yield();
       }
     }
