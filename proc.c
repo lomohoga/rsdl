@@ -152,16 +152,15 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->quantum_left = RSDL_PROC_QUANTUM;
-  enqueue(q, p);
 
   // Allocate kernel stack.
   if((p->kstack = kalloc()) == 0){
     p->state = UNUSED;
-    dequeue(q, p);
     release(&ptable.lock);
     return 0;
   }
 
+  enqueue(q, p);
   release(&ptable.lock);
   sp = p->kstack + KSTACKSIZE;
 
@@ -475,8 +474,16 @@ scheduler(void)
             enqueue(clevel, p);
           }
           else{
-            enqueue(expired->level + RSDL_STARTING_LEVEL, p);
-            p->quantum_left = RSDL_PROC_QUANTUM;
+            struct level *x = clevel + 1;
+
+            if(x == (active->level + RSDL_LEVELS)){
+              enqueue(expired->level + RSDL_STARTING_LEVEL, p);
+            }
+            else{
+              enqueue(x, p);
+            }
+
+            p->quantum_left = RSDL_PROC_QUANTUM; //replenish quantum
           }
         }
 
