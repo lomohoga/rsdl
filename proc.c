@@ -10,6 +10,8 @@
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
+  struct proc HEAD;
+  struct proc *TAIL;
 } ptable;
 
 static struct proc *initproc;
@@ -24,6 +26,7 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  ptable.TAIL = &(ptable.HEAD);
 }
 
 // Must be called with interrupts disabled
@@ -65,6 +68,35 @@ myproc(void) {
   return p;
 }
 
+static void
+enqueue(struct proc *p){
+  ptable.TAIL->next = p;
+  ptable.TAIL = p;
+}
+
+static void
+dequeue(struct proc *p){
+  struct proc *a = &(ptable.HEAD);
+
+  while(a != 0){
+    if(a->next == p){
+      goto remove;
+    }
+
+    a = a->next;
+  }
+  return;
+
+  remove:
+  if(p == ptable.TAIL){
+      ptable.TAIL = a;
+      a->next = 0;
+  }else{
+      a->next = p->next;
+      p->next = 0;
+  }
+}
+
 //PAGEBREAK: 32
 // Look in the process table for an UNUSED proc.
 // If found, change state to EMBRYO and initialize
@@ -88,14 +120,18 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-
-  release(&ptable.lock);
+  p->quantum_left = RSDL_PROC_QUANTUM;
+  enqueue(p);
 
   // Allocate kernel stack.
   if((p->kstack = kalloc()) == 0){
     p->state = UNUSED;
+    dequeue(p);
+    release(&ptable.lock);
     return 0;
   }
+
+  release(&ptable.lock);
   sp = p->kstack + KSTACKSIZE;
 
   // Leave room for trap frame.
@@ -294,6 +330,7 @@ wait(void)
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
+        p->quantum_left = 0;
         p->state = UNUSED;
         release(&ptable.lock);
         return pid;
@@ -310,6 +347,30 @@ wait(void)
     sleep(curproc, &ptable.lock);  //DOC: wait-sleep
   }
 }
+
+static void
+display(void){
+  struct proc *p = ptable.HEAD.next;
+
+  cprintf("%d|active|0(0)", ticks);
+
+  while(p != 0){
+    cprintf(",[%d]%s:%d(%d)", p->pid, p->name, p->state, p->quantum_left);
+    p = p->next;
+  }
+
+  cprintf("\n");
+}
+
+int schedlog_active = 0;
+int schedlog_lasttick = 0;
+
+void 
+schedlog(int n) {
+  schedlog_active = 1;
+  schedlog_lasttick = ticks + n;
+}
+
 
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
@@ -330,26 +391,44 @@ scheduler(void)
     // Enable interrupts on this processor.
     sti();
 
+    p = ptable.HEAD.next;
+
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
+    while(p != 0){
+      if(p->state != RUNNABLE){
+        p = p->next;
+        continue;
+      }
+
       c->proc = p;
       switchuvm(p);
       p->state = RUNNING;
 
+      //schedlog here
+      if(schedlog_active){
+        if(ticks > schedlog_lasttick){
+          schedlog_active = 0;
+        }
+        else{
+          display();
+        }
+      }
+
       swtch(&(c->scheduler), p->context);
       switchkvm();
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
+      dequeue(p);
+      if(p->state != ZOMBIE){
+        enqueue(p); // p might be exiting
+        p->quantum_left = RSDL_PROC_QUANTUM;
+      }
+
       c->proc = 0;
+      p = ptable.HEAD.next;
     }
+
     release(&ptable.lock);
 
   }
