@@ -7,14 +7,24 @@
 #include "proc.h"
 #include "spinlock.h"
 
+struct level{
+  struct proc HEAD;
+  struct proc *TAIL;
+};
+
+struct set{
+  struct level level[RSDL_LEVELS];
+};
+
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
-  struct proc HEAD;
-  struct proc *TAIL;
+  struct set set[2];
 } ptable;
 
 static struct proc *initproc;
+static struct set *active;
+static struct set *expired;
 
 int nextpid = 1;
 extern void forkret(void);
@@ -26,7 +36,24 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
-  ptable.TAIL = &(ptable.HEAD);
+
+  struct set *a = ptable.set;
+  struct set *b = ptable.set + 1;
+
+  //initialize HEAD and TAIL for each set
+  for(int c = 0; c < RSDL_LEVELS; c++){
+    //for set 0
+    struct level *d = a->level + c;
+    d->TAIL = &(d->HEAD);
+
+    //for set 1
+    struct level *e =  b->level + c;
+    e->TAIL = &(e->HEAD);
+  }
+  
+  //initialize active and expired sets
+  active = ptable.set;
+  expired = ptable.set + 1;
 }
 
 // Must be called with interrupts disabled
@@ -69,14 +96,16 @@ myproc(void) {
 }
 
 static void
-enqueue(struct proc *p){
-  ptable.TAIL->next = p;
-  ptable.TAIL = p;
+enqueue(struct level *dest, struct proc *p){
+
+  //p at this point MUST be dequeued!
+  dest->TAIL->next = p;
+  dest->TAIL = p;
 }
 
 static void
-dequeue(struct proc *p){
-  struct proc *a = &(ptable.HEAD);
+dequeue(struct level *src, struct proc *p){
+  struct proc *a = &(src->HEAD);
 
   while(a != 0){
     if(a->next == p){
@@ -88,8 +117,8 @@ dequeue(struct proc *p){
   return;
 
   remove:
-  if(p == ptable.TAIL){
-      ptable.TAIL = a;
+  if(p == src->TAIL){
+      src->TAIL = a;
       a->next = 0;
   }else{
       a->next = p->next;
@@ -118,15 +147,17 @@ allocproc(void)
   return 0;
 
 found:
+  struct level *q = active->level + RSDL_STARTING_LEVEL;
+
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->quantum_left = RSDL_PROC_QUANTUM;
-  enqueue(p);
+  enqueue(q, p);
 
   // Allocate kernel stack.
   if((p->kstack = kalloc()) == 0){
     p->state = UNUSED;
-    dequeue(p);
+    dequeue(q, p);
     release(&ptable.lock);
     return 0;
   }
@@ -350,16 +381,31 @@ wait(void)
 
 static void
 display(void){
-  struct proc *p = ptable.HEAD.next;
+  // print active set
+  for(int a = 0; a < RSDL_LEVELS; a++){
+    cprintf("%d|active|%d(0)", ticks, a);
 
-  cprintf("%d|active|0(0)", ticks);
+    struct proc *b = (active->level + a)->HEAD.next;
+    while(b != 0){
+      cprintf(",[%d]%s:%d(%d)", b->pid, b->name, b->state, b->quantum_left);
+      b = b->next;
+    }
 
-  while(p != 0){
-    cprintf(",[%d]%s:%d(%d)", p->pid, p->name, p->state, p->quantum_left);
-    p = p->next;
+    cprintf("\n");
   }
 
-  cprintf("\n");
+  // print expired set
+  for(int c = 0; c < RSDL_LEVELS; c++){
+    cprintf("%d|expired|%d(0)", ticks, c);
+
+    struct proc *d = (expired->level + c)->HEAD.next;
+    while(d != 0){
+      cprintf(",[%d]%s:%d(%d)", d->pid, d->name, d->state, d->quantum_left);
+      d = d->next;
+    }
+
+    cprintf("\n");
+  }
 }
 
 int schedlog_active = 0;
@@ -391,42 +437,76 @@ scheduler(void)
     // Enable interrupts on this processor.
     sti();
 
-    p = ptable.HEAD.next;
+    struct level *clevel = active->level;
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
 
-    while(p != 0){
-      if(p->state != RUNNABLE){
-        p = p->next;
-        continue;
-      }
+    while(clevel < (active->level + RSDL_LEVELS)){
+      p = clevel->HEAD.next;
 
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-
-      //schedlog here
-      if(schedlog_active){
-        if(ticks > schedlog_lasttick){
-          schedlog_active = 0;
+      while(p != 0){
+        if(p->state != RUNNABLE){
+          p = p->next;
+          continue;
         }
-        else{
-          display();
+
+        c->proc = p;
+        switchuvm(p);
+        p->state = RUNNING;
+
+        if(schedlog_active){
+          if(ticks > schedlog_lasttick){
+            schedlog_active = 0;
+          }
+          else{
+            display();
+          }
         }
+
+        swtch(&(c->scheduler), p->context);
+        switchkvm();
+
+        dequeue(clevel, p);
+
+        //see if p is exiting
+        if(p->state != ZOMBIE){
+          if(p->quantum_left){
+            enqueue(clevel, p);
+          }
+          else{
+            enqueue(expired->level + RSDL_STARTING_LEVEL, p);
+            p->quantum_left = RSDL_PROC_QUANTUM;
+          }
+        }
+
+        c->proc = 0;
+        clevel = active->level;
+        p = clevel->HEAD.next;
       }
 
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
+      clevel++;
+    }
 
-      dequeue(p);
-      if(p->state != ZOMBIE){
-        enqueue(p); // p might be exiting
-        p->quantum_left = RSDL_PROC_QUANTUM;
+    //swap active and expired sets
+    struct set *temp = active;
+    active = expired;
+    expired = temp;
+    
+    // migrate processes from expired to active
+    struct level *e;
+    for(e = expired->level; e < (expired->level + RSDL_LEVELS); e++){
+      struct proc *g = e->HEAD.next;
+
+      while(g != 0){
+        struct proc *next = g->next;
+        dequeue(e, g);
+        
+        enqueue(active->level + RSDL_STARTING_LEVEL, g);
+        g->quantum_left = RSDL_PROC_QUANTUM; //replenish process quantum upon migration
+        
+        g = next;
       }
-
-      c->proc = 0;
-      p = ptable.HEAD.next;
     }
 
     release(&ptable.lock);

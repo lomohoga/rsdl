@@ -1,1 +1,3 @@
 #define RSDL_PROC_QUANTUM 10
+#define RSDL_LEVELS 1
+#define RSDL_STARTING_LEVEL 0
